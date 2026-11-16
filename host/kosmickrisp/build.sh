@@ -466,6 +466,12 @@
 #              libmalloc-cleared view; DOOM 2016). Diagnostic only, recording is unchanged.
 #              Repro: REPRO_CASE=sentry-bj; a destroyed framebuffer view faults at the reported
 #              frames and offsets on 1.9.14 and is named first after; a live view logs nothing.
+#   0101       steamac: sparse residency images with ShaderWrite usage take residency from a twin placement
+#              sparse texture without ShaderWrite, mapped to the same heap pages by the same mapping updates
+#              (the twin's mip tail is clamped to its own, smaller tail size). Metal (macOS 26.6, M3 Max)
+#              reports the residency of a placement sparse texture with ShaderWrite for tile (x/2, y/2) of
+#              texel (x, y), with the right data: 167 failures in repro sparse, 0 after. Views get residency
+#              views of the twin (the 0035 path). Repro: sparse.c.
 #
 # Two meson builds: (1) the host compiler tools mesa_clc + vtn_bindgen2 against Homebrew LLVM
 # (shared) and SPIRV-LLVM-Translator, installed into work/build/host-kosmickrisp/clc; (2) the driver
@@ -700,6 +706,7 @@ mv -f "$lib.tmp.$$" "$lib"
 	echo "  0098 = steamac: rejected image views log real format features, external memory and block compatibility (STEAMAC-G)"
 	echo "  0099 = steamac: render pipelines whose vertex function does not resolve fail, logged, instead of aborting (STEAMAC-BN/BP)"
 	echo "  0100 = steamac: render pass begin names attachments whose image view was destroyed (STEAMAC-BJ/BK)"
+	echo "  0101 = steamac: sparse residency from a twin texture without ShaderWrite (M3 reports residency at half the texel coordinates)"
 	echo
 	echo "Known gaps (host/moltenvk/repro/run.sh): transform feedback with strip geometry shaders and"
 	echo "the overflow counter (draft !44928)."

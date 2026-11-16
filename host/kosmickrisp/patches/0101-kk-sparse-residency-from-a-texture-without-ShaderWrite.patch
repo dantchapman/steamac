@@ -1,0 +1,192 @@
+From: danchapman <dantchapman@gmail.com>
+Subject: [PATCH] kk: sparse residency from a texture without ShaderWrite
+
+Claude discovered a bug in Apple's Metal on M3. For sparse textures created with "shader write" permission,
+Metal reports wrongly which parts of the texture have memory behind them.
+This was confirmed with a small standalone Metal program.
+The patch gives each affected texture a read-only twin that shares the same memory,
+and the driver checks the twin instead.
+Seen on macOS 26.6, M3 Max.
+
+Generated-by: LLM
+
+--- a/src/kosmickrisp/vulkan/kk_image.h
++++ b/src/kosmickrisp/vulkan/kk_image.h
+@@ -40,6 +40,7 @@
+    mtl_texture *mtl_handle;
+    /* Metal handle with 2D array type for 3D images */
+    mtl_texture *mtl_handle_array;
++   mtl_texture *mtl_handle_residency;
+    uint64_t addr;
+    /* The base textures of mtl_handle and mtl_handle_array were added to the
+     * device's residency set by this plane (bound to memory, or sparse) and
+@@ -69,6 +70,7 @@
+    /* Tiles of each level below mtl_tail_level */
+    VkExtent3D level_tiles[KK_MAX_MIP_LEVELS];
+    uint64_t layer_pages;
++   uint64_t residency_tail_pages;
+ };
+ 
+ struct kk_image {
+--- a/src/kosmickrisp/vulkan/kk_image.c
++++ b/src/kosmickrisp/vulkan/kk_image.c
+@@ -724,6 +724,8 @@
+       kk_device_add_texture_to_residency_set(dev, plane->mtl_handle);
+    if (plane->mtl_handle_array)
+       kk_device_add_texture_to_residency_set(dev, plane->mtl_handle_array);
++   if (plane->mtl_handle_residency)
++      kk_device_add_texture_to_residency_set(dev, plane->mtl_handle_residency);
+    plane->resident = true;
+ }
+ 
+@@ -735,6 +737,9 @@
+       kk_device_remove_texture_from_residency_set(dev, plane->mtl_handle);
+    if (plane->mtl_handle_array)
+       kk_device_remove_texture_from_residency_set(dev, plane->mtl_handle_array);
++   if (plane->mtl_handle_residency)
++      kk_device_remove_texture_from_residency_set(dev,
++                                                  plane->mtl_handle_residency);
+    plane->resident = false;
+ }
+ 
+@@ -749,6 +754,8 @@
+       mtl_release(plane->mtl_handle);
+    if (plane->mtl_handle_array != NULL)
+       mtl_release(plane->mtl_handle_array);
++   if (plane->mtl_handle_residency != NULL)
++      mtl_release(plane->mtl_handle_residency);
+ }
+ 
+ static void
+--- a/src/kosmickrisp/vulkan/kk_sparse.c
++++ b/src/kosmickrisp/vulkan/kk_sparse.c
+@@ -138,6 +138,16 @@
+    if (plane->mtl_handle == NULL)
+       return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+ 
++   if ((image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT) &&
++       (layout->usage & MTL_TEXTURE_USAGE_SHADER_WRITE)) {
++      struct kk_image_layout residency_layout = *layout;
++      residency_layout.usage &= ~MTL_TEXTURE_USAGE_SHADER_WRITE;
++      plane->mtl_handle_residency =
++         mtl_new_placement_sparse_texture(dev->mtl_handle, &residency_layout);
++      if (plane->mtl_handle_residency == NULL)
++         return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++   }
++
+    struct mtl_size tile = mtl_placement_sparse_tile_size(dev->mtl_handle, layout);
+    sparse->tile = (VkExtent3D){tile.x, tile.y, tile.z};
+ 
+@@ -179,6 +189,18 @@
+    }
+    sparse->level_page[sparse->mtl_tail_level] = page;
+    sparse->layer_pages = page + tail_pages;
++
++   if (plane->mtl_handle_residency) {
++      if (MIN2(mtl_texture_get_first_mipmap_in_tail(plane->mtl_handle_residency),
++               levels) != sparse->mtl_tail_level) {
++         mtl_release(plane->mtl_handle_residency);
++         plane->mtl_handle_residency = NULL;
++      } else if (sparse->mtl_tail_level < levels) {
++         sparse->residency_tail_pages = DIV_ROUND_UP(
++            mtl_texture_get_tail_size_in_bytes(plane->mtl_handle_residency),
++            KK_SPARSE_PAGE_SIZE_B);
++      }
++   }
+ 
+    return VK_SUCCESS;
+ }
+@@ -254,6 +276,36 @@
+    mtl_command_queue_update_texture_mappings(queue->mtl_handle, texture, heap,
+                                              mappings, count);
+    simple_mtx_unlock(&queue->sparse.lock);
++}
++
++static void
++kk_sparse_update_residency_texture(
++   struct kk_queue *queue, const struct kk_image *image, mtl_heap *heap,
++   const struct mtl_sparse_texture_mapping *mappings, uint32_t count)
++{
++   mtl_texture *texture = image->planes[0].mtl_handle_residency;
++   const struct kk_image_sparse *sparse = &image->sparse;
++   struct mtl_sparse_texture_mapping batch[64];
++   uint32_t n = 0u;
++
++   if (texture == NULL)
++      return;
++
++   for (uint32_t i = 0u; i < count; ++i) {
++      struct mtl_sparse_texture_mapping m = mappings[i];
++      if (m.level == sparse->mtl_tail_level) {
++         if (m.origin.x >= sparse->residency_tail_pages)
++            continue;
++         m.size.x = MIN2(m.size.x, sparse->residency_tail_pages - m.origin.x);
++      }
++      batch[n++] = m;
++      if (n == ARRAY_SIZE(batch)) {
++         kk_sparse_update_texture(queue, texture, heap, batch, n);
++         n = 0u;
++      }
++   }
++   if (n)
++      kk_sparse_update_texture(queue, texture, heap, batch, n);
+ }
+ 
+ static void
+@@ -757,6 +809,11 @@
+ 
+       kk_sparse_update_texture(
+          queue, image->planes[0].mtl_handle, kk_sparse_memory_heap(mem),
++         util_dynarray_begin(mappings),
++         util_dynarray_num_elements(mappings,
++                                    struct mtl_sparse_texture_mapping));
++      kk_sparse_update_residency_texture(
++         queue, image, kk_sparse_memory_heap(mem),
+          util_dynarray_begin(mappings),
+          util_dynarray_num_elements(mappings,
+                                     struct mtl_sparse_texture_mapping));
+@@ -790,6 +847,9 @@
+       };
+       kk_sparse_update_texture(queue, image->planes[0].mtl_handle,
+                                kk_sparse_memory_heap(mem), &mapping, 1u);
++      kk_sparse_update_residency_texture(queue, image,
++                                         kk_sparse_memory_heap(mem), &mapping,
++                                         1u);
+    }
+ }
+ 
+--- a/src/kosmickrisp/vulkan/kk_image_view.c
++++ b/src/kosmickrisp/vulkan/kk_image_view.c
+@@ -235,9 +235,13 @@
+       /* Metal reports the residency of a view with baseMipLevel > 0 for the
+        * image's levels from 0: sparse operations query a view that also has
+        * the levels below (struct kk_sampled_image_descriptor). */
++      mtl_texture *residency_handle = mtl_handle;
++      if (image->planes[image_plane].mtl_handle_residency &&
++          mtl_handle == image->planes[image_plane].mtl_handle)
++         residency_handle = image->planes[image_plane].mtl_handle_residency;
+       const bool residency_view =
+          (image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT) &&
+-         view_layout.base_level > 0;
++         (view_layout.base_level > 0 || residency_handle != mtl_handle);
+       struct kk_view_layout residency_layout = view_layout;
+       residency_layout.base_level = 0;
+       residency_layout.num_levels =
+@@ -252,7 +256,7 @@
+                view->planes[view_plane].mtl_handle_sampled);
+          if (residency_view) {
+             view->planes[view_plane].mtl_handle_residency_sampled =
+-               mtl_new_texture_view_with(mtl_handle, &residency_layout);
++               mtl_new_texture_view_with(residency_handle, &residency_layout);
+             view->planes[view_plane].residency_sampled_gpu_resource_id =
+                mtl_texture_get_gpu_resource_id(
+                   view->planes[view_plane].mtl_handle_residency_sampled);
+@@ -274,7 +278,7 @@
+                view->planes[view_plane].mtl_handle_storage);
+          if (residency_view) {
+             view->planes[view_plane].mtl_handle_residency_storage =
+-               mtl_new_texture_view_with(mtl_handle, &residency_layout);
++               mtl_new_texture_view_with(residency_handle, &residency_layout);
+             view->planes[view_plane].residency_storage_gpu_resource_id =
+                mtl_texture_get_gpu_resource_id(
+                   view->planes[view_plane].mtl_handle_residency_storage);
